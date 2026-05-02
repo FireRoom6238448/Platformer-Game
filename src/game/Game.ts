@@ -40,6 +40,9 @@ export class Game {
     wallTouch: null as 'left' | 'right' | null,
     facing: 1, // 1 for right, -1 for left
     dead: false,
+    animState: 'Idle' as 'Idle' | 'Run' | 'Jump' | 'DoubleJump' | 'Fall' | 'WallSlide',
+    animFrame: 0,
+    animTimer: 0,
   };
 
   private levelData: LevelData | null = null;
@@ -63,7 +66,23 @@ export class Game {
   private particles: {x: number, y: number, vx: number, vy: number, life: number, maxLife: number, color: string}[] = [];
   private floatingTexts: {x: number, y: number, text: string, color: string, life: number, maxLife: number}[] = [];
 
-  constructor(private input: InputManager, private callbacks: Callbacks) {}
+  private animations: Record<string, { image: HTMLImageElement | null, frames: number, frameRate: number, src: string }> = {
+    Idle: { image: null, frames: 11, frameRate: 20, src: '/Idle.png' },
+    Run: { image: null, frames: 12, frameRate: 20, src: '/Run.png' },
+    Jump: { image: null, frames: 1, frameRate: 1, src: '/Jump.png' },
+    DoubleJump: { image: null, frames: 6, frameRate: 20, src: '/Double_Jump.png' },
+    Fall: { image: null, frames: 1, frameRate: 1, src: '/Fall.png' },
+    WallSlide: { image: null, frames: 5, frameRate: 20, src: '/Wall_Jump.png' }
+  };
+
+  constructor(private input: InputManager, private callbacks: Callbacks) {
+    for (const key in this.animations) {
+      const anim = this.animations[key];
+      const img = new Image();
+      img.src = anim.src;
+      img.onload = () => { anim.image = img; };
+    }
+  }
 
   resize(w: number, h: number) {
     this.camera.w = w;
@@ -203,7 +222,9 @@ export class Game {
     for (let y = startY; y <= endY; y++) {
       for (let x = startX; x <= endX; x++) {
         if (y < 0 || y >= this.levelData.height || x < 0 || x >= this.levelData.width) continue;
-        const tile = this.levelData.grid[y][x];
+        const row = this.levelData.grid[y];
+        if (!row) continue;
+        const tile = row[x];
         if (tile === '#') {
           const tileRect = { x: x * TILE_SIZE, y: y * TILE_SIZE, w: TILE_SIZE, h: TILE_SIZE };
           if (this.isAABB(rect, tileRect)) {
@@ -380,6 +401,38 @@ export class Game {
       p.dead = true;
     }
 
+    // Determine animation state
+    let nextAnimState: typeof p.animState = 'Idle';
+    if (p.isDashing || p.isSliding) {
+      nextAnimState = 'DoubleJump'; // We don't have a dash/slide animation
+    } else if (p.wallTouch) {
+      nextAnimState = 'WallSlide';
+    } else if (!p.isGrounded) {
+      if (p.vy < 0) {
+        nextAnimState = !p.canDoubleJump ? 'DoubleJump' : 'Jump';
+      } else {
+        nextAnimState = 'Fall';
+      }
+    } else if (Math.abs(p.vx) > 10) {
+      nextAnimState = 'Run';
+    }
+
+    if (p.animState !== nextAnimState) {
+      p.animState = nextAnimState;
+      p.animFrame = 0;
+      p.animTimer = 0;
+    }
+
+    p.animTimer += dt;
+    const anim = this.animations[p.animState];
+    if (anim) {
+      const frameDuration = 1 / anim.frameRate;
+      if (p.animTimer >= frameDuration) {
+        p.animTimer -= frameDuration;
+        p.animFrame = (p.animFrame + 1) % anim.frames;
+      }
+    }
+
     // Update Particles
     for (const part of this.particles) {
       part.x += part.vx * dt;
@@ -431,7 +484,9 @@ export class Game {
       for (let x = startX; x <= endX; x++) {
         if (y < 0 || y >= this.levelData.height || x < 0 || x >= this.levelData.width) continue;
         
-        const tile = this.levelData.grid[y][x];
+        const row = this.levelData.grid[y];
+        if (!row) continue;
+        const tile = row[x];
         
         if (tile === '#') { // Solid block
           const tileRect = { x: x * TILE_SIZE, y: y * TILE_SIZE, w: TILE_SIZE, h: TILE_SIZE };
@@ -535,7 +590,10 @@ export class Game {
 
     for (let y = startY; y < endY; y++) {
       for (let x = startX; x < endX; x++) {
-        const tile = this.levelData.grid[y][x];
+        if (y < 0 || y >= this.levelData.height || x < 0 || x >= this.levelData.width) continue;
+        const row = this.levelData.grid[y];
+        if (!row) continue;
+        const tile = row[x];
         const tx = x * TILE_SIZE;
         const ty = y * TILE_SIZE;
 
@@ -609,39 +667,76 @@ export class Game {
       const px = this.player.x;
       const py = this.player.y;
       
-      // Shadow/Trail if dashing
-      if (this.player.isDashing) {
-        ctx.fillStyle = 'rgba(0, 255, 255, 0.5)';
-        ctx.fillRect(px - this.player.vx * 0.05, py, this.player.w, this.player.h);
+      const anim = this.animations[this.player.animState];
+      if (anim && anim.image) {
+        ctx.save();
+        // The player sprite is 32x32, hitbox is 24x24
+        // So we need to draw it slightly offset (-4, -8) to fit
+        const drawX = px + this.player.w/2;
+        const drawY = py + this.player.h - 16;
+        
+        ctx.translate(drawX, drawY);
+        // Flip horizontally if facing left
+        if (this.player.facing === -1) {
+          ctx.scale(-1, 1);
+        }
+
+        // Add squeeze/squash based on velocity
+        let squeezeX = 1;
+        let squeezeY = 1;
+        if (!this.player.isGrounded && !this.player.wallTouch && !this.player.isDashing) {
+          squeezeY = 1 + Math.min(Math.abs(this.player.vy) / 1500, 0.4);
+          squeezeX = 1 - Math.min(Math.abs(this.player.vy) / 1500, 0.4);
+        } else if (this.player.isDashing) {
+          squeezeX = 1.4;
+          squeezeY = 0.6;
+        } else if (this.player.wallTouch) {
+          squeezeY = 1.2;
+          squeezeX = 0.8;
+        }
+        ctx.scale(squeezeX, squeezeY);
+
+        ctx.drawImage(
+          anim.image,
+          this.player.animFrame * 32, 0, 32, 32,
+          -16, -16, 32, 32
+        );
+        ctx.restore();
+      } else {
+        // Fallback procedural
+        // Shadow/Trail if dashing
+        if (this.player.isDashing) {
+          ctx.fillStyle = 'rgba(0, 255, 255, 0.5)';
+          ctx.fillRect(px - this.player.vx * 0.05, py, this.player.w, this.player.h);
+        }
+        
+        ctx.fillStyle = '#00FFFF'; // Player cyan
+        let squeezeX = 1;
+        let squeezeY = 1;
+
+        if (!this.player.isGrounded && !this.player.wallTouch && !this.player.isDashing) {
+          squeezeY = 1 + Math.min(Math.abs(this.player.vy) / 1500, 0.4);
+          squeezeX = 1 - Math.min(Math.abs(this.player.vy) / 1500, 0.4);
+        } else if (this.player.isDashing) {
+          squeezeX = 1.4;
+          squeezeY = 0.6;
+        } else if (this.player.wallTouch) {
+          squeezeY = 1.2;
+          squeezeX = 0.8;
+        }
+
+        const drawW = this.player.w * squeezeX;
+        const drawH = this.player.h * squeezeY;
+        const drawX = px + (this.player.w - drawW)/2;
+        const drawY = py + (this.player.h - drawH);
+
+        ctx.fillRect(drawX, drawY, drawW, drawH);
+
+        // Eye
+        ctx.fillStyle = '#000';
+        const eyeOffset = this.player.facing === 1 ? 4 : -10;
+        ctx.fillRect(drawX + drawW/2 + eyeOffset, drawY + 4, 6, 6);
       }
-      
-      ctx.fillStyle = '#00FFFF'; // Player cyan
-      // Stretch depending on velocity
-      let squeezeX = 1;
-      let squeezeY = 1;
-
-      if (!this.player.isGrounded && !this.player.wallTouch && !this.player.isDashing) {
-        squeezeY = 1 + Math.min(Math.abs(this.player.vy) / 1500, 0.4);
-        squeezeX = 1 - Math.min(Math.abs(this.player.vy) / 1500, 0.4);
-      } else if (this.player.isDashing) {
-        squeezeX = 1.4;
-        squeezeY = 0.6;
-      } else if (this.player.wallTouch) {
-        squeezeY = 1.2;
-        squeezeX = 0.8;
-      }
-
-      const drawW = this.player.w * squeezeX;
-      const drawH = this.player.h * squeezeY;
-      const drawX = px + (this.player.w - drawW)/2;
-      const drawY = py + (this.player.h - drawH);
-
-      ctx.fillRect(drawX, drawY, drawW, drawH);
-
-      // Eye
-      ctx.fillStyle = '#000';
-      const eyeOffset = this.player.facing === 1 ? 4 : -10;
-      ctx.fillRect(drawX + drawW/2 + eyeOffset, drawY + 4, 6, 6);
     }
 
     ctx.restore(); // Pop camera

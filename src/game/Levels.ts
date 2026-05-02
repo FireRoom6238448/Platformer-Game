@@ -70,7 +70,7 @@ export const levels: LevelData[] = [
   {
     // Level requiring wall jumping
     width: 30,
-    height: 25,
+    height: 20,
     grid: [
       "..............................",
       "..............................",
