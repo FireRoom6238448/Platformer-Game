@@ -16,19 +16,30 @@ interface Camera {
 }
 
 interface Callbacks {
-  onStateChange: (state: 'MENU' | 'PLAYING' | 'WIN' | 'GAMEOVER' | 'ALL_CLEARED', level?: number) => void;
+  onStateChange: (state: 'MENU' | 'PLAYING' | 'WIN' | 'GAMEOVER' | 'ALL_CLEARED' | 'PAUSED' | 'LEVEL_SELECT' | 'SHOP', level?: number, data?: any) => void;
 }
 
 export class Game {
   public currentLevel: number = 1;
   public totalScore: number = 0;
   public levelStartScore: number = 0;
-  private state: 'MENU' | 'PLAYING' | 'WIN' | 'GAMEOVER' | 'ALL_CLEARED' = 'MENU';
+  public timer: number = 0;
+  public totalCoins: number = 0;
+  public levelCoins: number = 0;
+  public gameStateData: any = null; // Store final level stats
+
+  public unlockedLevels: number = 1;
+  public aesthetics: { playerColor: string, trailColor: string } = { playerColor: '#00FFFF', trailColor: 'rgba(0, 255, 255, 0.5)' };
+
+  private state: 'MENU' | 'PLAYING' | 'PAUSED' | 'WIN' | 'GAMEOVER' | 'ALL_CLEARED' | 'LEVEL_SELECT' | 'SHOP' = 'MENU';
+
   
   private player = {
     x: 0, y: 0, w: 24, h: 24,
     vx: 0, vy: 0,
     isGrounded: false,
+    coyoteTimer: 0,
+    jumpBufferTimer: 0,
     canDoubleJump: true,
     isDashing: false,
     isSliding: false,
@@ -37,12 +48,13 @@ export class Game {
     comboScore: 0,
     comboMultiplier: 0,
     comboTimer: 0,
+    slideTrickCooldown: 0,
+    tricksThisAir: new Set<string>(),
     wallTouch: null as 'left' | 'right' | null,
     facing: 1, // 1 for right, -1 for left
     dead: false,
-    animState: 'Idle' as 'Idle' | 'Run' | 'Jump' | 'DoubleJump' | 'Fall' | 'WallSlide',
-    animFrame: 0,
-    animTimer: 0,
+    stamina: 100,
+    isBouncing: false,
   };
 
   private levelData: LevelData | null = null;
@@ -65,23 +77,34 @@ export class Game {
 
   private particles: {x: number, y: number, vx: number, vy: number, life: number, maxLife: number, color: string}[] = [];
   private floatingTexts: {x: number, y: number, text: string, color: string, life: number, maxLife: number}[] = [];
-
-  private animations: Record<string, { image: HTMLImageElement | null, frames: number, frameRate: number, src: string }> = {
-    Idle: { image: null, frames: 11, frameRate: 20, src: '/Idle.png' },
-    Run: { image: null, frames: 12, frameRate: 20, src: '/Run.png' },
-    Jump: { image: null, frames: 1, frameRate: 1, src: '/Jump.png' },
-    DoubleJump: { image: null, frames: 6, frameRate: 20, src: '/Double_Jump.png' },
-    Fall: { image: null, frames: 1, frameRate: 1, src: '/Fall.png' },
-    WallSlide: { image: null, frames: 5, frameRate: 20, src: '/Wall_Jump.png' }
-  };
+  private coinsData: {x: number, y: number, gathered: boolean}[] = [];
+  private enemiesData: {x: number, y: number, w: number, h: number, vx: number, dir: number, startX: number, dead: boolean}[] = [];
+  private levelGrid: string[][] = []; // We will parse it to remove C and E
 
   constructor(private input: InputManager, private callbacks: Callbacks) {
-    for (const key in this.animations) {
-      const anim = this.animations[key];
-      const img = new Image();
-      img.src = anim.src;
-      img.onload = () => { anim.image = img; };
-    }
+    this.loadSaveData();
+  }
+
+  public loadSaveData() {
+    try {
+      const saved = localStorage.getItem('parkour_save');
+      if (saved) {
+        const data = JSON.parse(saved);
+        this.unlockedLevels = data.unlockedLevels || 1;
+        this.totalCoins = data.totalCoins || 0;
+        if (data.aesthetics) this.aesthetics = data.aesthetics;
+      }
+    } catch(e) {}
+  }
+
+  public saveGame() {
+    try {
+      localStorage.setItem('parkour_save', JSON.stringify({
+        unlockedLevels: this.unlockedLevels,
+        totalCoins: this.totalCoins,
+        aesthetics: this.aesthetics
+      }));
+    } catch(e) {}
   }
 
   resize(w: number, h: number) {
@@ -91,6 +114,10 @@ export class Game {
 
   startLevel(levelNum: number) {
     if (levelNum > levels.length) {
+      if (this.currentLevel > this.unlockedLevels) {
+        this.unlockedLevels = this.currentLevel;
+        this.saveGame();
+      }
       this.setState('ALL_CLEARED');
       return;
     }
@@ -103,15 +130,32 @@ export class Game {
     }
     
     this.currentLevel = levelNum;
+    if (levelNum > this.unlockedLevels) {
+      this.unlockedLevels = levelNum;
+      this.saveGame();
+    }
     this.levelData = levels[levelNum - 1];
+    this.timer = 0;
+    this.levelCoins = 0;
     this.resetPlayer();
     this.setState('PLAYING', levelNum);
+  }
+
+  startCustomLevel(grid: string[]) {
+    this.currentLevel = -1;
+    this.levelData = { width: grid[0].length, height: grid.length, grid };
+    this.timer = 0;
+    this.levelCoins = 0; // Coins collected here won't be saved if we add logic for it.
+    this.resetPlayer();
+    this.setState('PLAYING', -1);
   }
 
   private resetPlayer() {
     this.player.vx = 0;
     this.player.vy = 0;
     this.player.isGrounded = false;
+    this.player.coyoteTimer = 0;
+    this.player.jumpBufferTimer = 0;
     this.player.canDoubleJump = true;
     this.player.isDashing = false;
     this.player.isSliding = false;
@@ -120,33 +164,53 @@ export class Game {
     this.player.comboScore = 0;
     this.player.comboMultiplier = 0;
     this.player.comboTimer = 0;
+    this.player.slideTrickCooldown = 0;
+    this.player.tricksThisAir.clear();
     this.player.wallTouch = null;
     this.player.dead = false;
     this.player.facing = 1;
+    this.player.stamina = 100;
+    this.player.isBouncing = false;
     this.player.w = 24;
     this.player.h = 24;
     this.particles = [];
     this.floatingTexts = [];
+    this.coinsData = [];
+    this.enemiesData = [];
+    this.levelGrid = [];
 
-    // Find spawn
+    // Parse level grid
     if (this.levelData) {
       for (let y = 0; y < this.levelData.height; y++) {
-        const row = this.levelData.grid[y];
-        if(!row) continue;
+        const row = this.levelData.grid[y] || '';
+        const parsedRow = [];
         for (let x = 0; x < row.length; x++) {
-          if (row[x] === '@') {
+          const tile = row[x];
+          if (tile === '@') {
             this.player.x = x * TILE_SIZE + (TILE_SIZE - this.player.w) / 2;
             this.player.y = y * TILE_SIZE + (TILE_SIZE - this.player.h);
-            return;
+            parsedRow.push('.'); // Replace spawn with empty
+          } else if (tile === 'C') {
+            this.coinsData.push({ x: x * TILE_SIZE + TILE_SIZE/2, y: y * TILE_SIZE + TILE_SIZE/2, gathered: false });
+            parsedRow.push('.'); 
+          } else if (tile === 'E') {
+            this.enemiesData.push({ 
+              x: x * TILE_SIZE, y: y * TILE_SIZE + TILE_SIZE - 24, 
+              w: 24, h: 24, vx: 100, dir: 1, startX: x * TILE_SIZE, dead: false 
+            });
+            parsedRow.push('.');
+          } else {
+            parsedRow.push(tile);
           }
         }
+        this.levelGrid.push(parsedRow);
       }
     }
   }
 
-  private setState(state: typeof this.state, level?: number) {
+  public setState(state: typeof this.state, level?: number, data?: any) {
     this.state = state;
-    this.callbacks.onStateChange(state, level);
+    this.callbacks.onStateChange(state, level, data);
   }
 
   private spawnParticles(x: number, y: number, count: number, color: string, speedMult: number = 1) {
@@ -213,7 +277,7 @@ export class Game {
   }
 
   private isRectColliding(rect: Rect): boolean {
-    if (!this.levelData) return false;
+    if (!this.levelData || !this.levelGrid) return false;
     const startX = Math.floor(rect.x / TILE_SIZE);
     const endX = Math.floor((rect.x + rect.w) / TILE_SIZE);
     const startY = Math.floor(rect.y / TILE_SIZE);
@@ -222,7 +286,7 @@ export class Game {
     for (let y = startY; y <= endY; y++) {
       for (let x = startX; x <= endX; x++) {
         if (y < 0 || y >= this.levelData.height || x < 0 || x >= this.levelData.width) continue;
-        const row = this.levelData.grid[y];
+        const row = this.levelGrid[y];
         if (!row) continue;
         const tile = row[x];
         if (tile === '#') {
@@ -237,6 +301,15 @@ export class Game {
   }
 
   private addTrick(name: string, points: number) {
+    // Limits
+    if (name.includes('Slide')) {
+      if (this.player.slideTrickCooldown > 0) return;
+      this.player.slideTrickCooldown = 1.0;
+    } else {
+      if (this.player.tricksThisAir.has(name)) return;
+      this.player.tricksThisAir.add(name);
+    }
+
     if (this.player.comboTimer <= 0) {
       this.player.comboScore = 0;
       this.player.comboMultiplier = 0;
@@ -252,6 +325,14 @@ export class Game {
 
   update(dt: number) {
     this.input.update();
+
+    if (this.input.isJustPressed('Escape') && this.state === 'PLAYING') {
+      this.setState('PAUSED', this.currentLevel);
+      return;
+    } else if (this.input.isJustPressed('Escape') && this.state === 'PAUSED') {
+      this.setState('PLAYING', this.currentLevel);
+      return;
+    }
     
     if (this.state !== 'PLAYING') return;
 
@@ -262,8 +343,43 @@ export class Game {
       return;
     }
 
+    this.timer += dt;
+
+    // Coins logic
+    for (const c of this.coinsData) {
+      if (!c.gathered) {
+        const dx = (p.x + p.w/2) - c.x;
+        const dy = (p.y + p.h/2) - c.y;
+        if (Math.hypot(dx, dy) < 20) {
+          c.gathered = true;
+          this.levelCoins++;
+          this.spawnParticles(c.x, c.y, 10, '#FFD700');
+          this.addTrick('Coin!', 50);
+        }
+      }
+    }
+
+    // Enemies logic
+    if (this.levelGrid) {
+      for (const e of this.enemiesData) {
+        if (!e.dead) {
+          e.x += e.vx * e.dir * dt;
+          if (Math.abs(e.x - e.startX) > TILE_SIZE * 3) { // Patrol 3 tiles
+            e.dir *= -1;
+            e.x += e.vx * e.dir * dt; // prevent stuck
+          }
+          const eRect = {x: e.x, y: e.y, w: e.w, h: e.h};
+          if (this.isAABB(p, eRect)) {
+            p.dead = true;
+            this.spawnParticles(p.x + p.w/2, p.y + p.h/2, 30, '#ff0000', 2);
+          }
+        }
+      }
+    }
+
     // Dash logic
     if (p.dashCooldown > 0) p.dashCooldown -= dt;
+    if (p.slideTrickCooldown > 0) p.slideTrickCooldown -= dt;
     
     // Update floating texts
     for (const ft of this.floatingTexts) {
@@ -290,6 +406,7 @@ export class Game {
       }
     }
     
+    let moveDir = 0;
     if (p.isDashing) {
       p.dashTime -= dt;
       p.vx = p.facing * this.dashSpeed;
@@ -302,7 +419,6 @@ export class Game {
       }
     } else {
       // Horizontal movement
-      let moveDir = 0;
       if (!p.isSliding) {
         if (this.input.isDown('ArrowLeft') || this.input.isDown('KeyA')) moveDir -= 1;
         if (this.input.isDown('ArrowRight') || this.input.isDown('KeyD')) moveDir += 1;
@@ -334,25 +450,43 @@ export class Game {
         if (p.vy > this.maxFallSpeed) p.vy = this.maxFallSpeed;
       }
 
-      // Jumping
+      if (p.isGrounded) {
+        p.coyoteTimer = 0.1; // 100ms
+      } else {
+        p.coyoteTimer -= dt;
+      }
+
+      p.jumpBufferTimer -= dt;
       if (this.input.isJustPressed('Space') || this.input.isJustPressed('ArrowUp')) {
-        if (p.isGrounded) {
+        p.jumpBufferTimer = 0.15; // 150ms buffer
+      }
+
+      // Jumping
+      if (p.jumpBufferTimer > 0) {
+        if (p.coyoteTimer > 0) {
           p.vy = this.jumpForce;
+          p.coyoteTimer = 0;
+          p.jumpBufferTimer = 0;
           p.isGrounded = false;
           this.spawnParticles(p.x + p.w/2, p.y + p.h, 10, '#ffffff');
-          if (p.comboMultiplier > 0) this.addTrick('Jump', 10);
-        } else if (p.wallTouch) {
+          // No points for simple jump, to prevent spam
+        } else if (p.wallTouch && p.stamina >= 20) {
           // Wall Jump
           p.vx = p.wallTouch === 'left' ? this.wallJumpVx : -this.wallJumpVx;
           p.vy = this.wallJumpVy;
           p.facing = p.wallTouch === 'left' ? 1 : -1;
           p.canDoubleJump = true; // Refresh double jump on wall touch
+          p.stamina -= 20;
+          p.jumpBufferTimer = 0;
           this.spawnParticles(p.wallTouch === 'left' ? p.x : p.x + p.w, p.y + p.h/2, 15, '#ffffff');
-          this.addTrick('Wall Jump', 100);
-        } else if (p.canDoubleJump) {
+          const wallName = p.wallTouch === 'left' ? 'Wall Jump L' : 'Wall Jump R';
+          this.addTrick(wallName, 100);
+        } else if (p.canDoubleJump && p.stamina >= 30) {
           // Double Jump
           p.vy = this.doubleJumpForce;
           p.canDoubleJump = false;
+          p.stamina -= 30;
+          p.jumpBufferTimer = 0;
           this.spawnParticles(p.x + p.w/2, p.y + p.h, 10, '#00ffff');
           this.addTrick('Double Jump', 50);
         }
@@ -386,51 +520,36 @@ export class Game {
       }
     }
 
+    // Handle variable jump height
+    if (!this.input.isDown('Space') && !this.input.isDown('ArrowUp') && !this.input.isDown('KeyW') && p.vy < -200 && !p.isDashing && !p.isBouncing) {
+       p.vy += this.gravity * 2 * dt;
+    }
+    
+    // Clear bouncing flag if falling
+    if (p.vy > 0) p.isBouncing = false;
+
     // Determine dash
-    if ((this.input.isJustPressed('ShiftLeft') || this.input.isJustPressed('ShiftRight')) && !p.isDashing && p.dashCooldown <= 0) {
+    if ((this.input.isJustPressed('ShiftLeft') || this.input.isJustPressed('ShiftRight')) && !p.isDashing && p.dashCooldown <= 0 && p.stamina >= 30) {
       p.isDashing = true;
       p.dashTime = 0.15;
       p.dashCooldown = 0.8;
+      p.stamina -= 30;
       this.spawnParticles(p.x + p.w/2, p.y + p.h/2, 20, '#00ffff');
       this.addTrick('Dash', 50);
     }
+    
+    // Stamina recovery
+    if (p.isGrounded && !p.isSliding && !Math.abs(p.vx) && moveDir === 0 ) {
+       p.stamina += 80 * dt;
+    } else if (p.isGrounded) {
+       p.stamina += 40 * dt;
+    }
+    if (p.stamina > 100) p.stamina = 100;
 
     this.applyPhysics(dt);
 
     if (p.y > (this.levelData?.height || 0) * TILE_SIZE + 100) {
       p.dead = true;
-    }
-
-    // Determine animation state
-    let nextAnimState: typeof p.animState = 'Idle';
-    if (p.isDashing || p.isSliding) {
-      nextAnimState = 'DoubleJump'; // We don't have a dash/slide animation
-    } else if (p.wallTouch) {
-      nextAnimState = 'WallSlide';
-    } else if (!p.isGrounded) {
-      if (p.vy < 0) {
-        nextAnimState = !p.canDoubleJump ? 'DoubleJump' : 'Jump';
-      } else {
-        nextAnimState = 'Fall';
-      }
-    } else if (Math.abs(p.vx) > 10) {
-      nextAnimState = 'Run';
-    }
-
-    if (p.animState !== nextAnimState) {
-      p.animState = nextAnimState;
-      p.animFrame = 0;
-      p.animTimer = 0;
-    }
-
-    p.animTimer += dt;
-    const anim = this.animations[p.animState];
-    if (anim) {
-      const frameDuration = 1 / anim.frameRate;
-      if (p.animTimer >= frameDuration) {
-        p.animTimer -= frameDuration;
-        p.animFrame = (p.animFrame + 1) % anim.frames;
-      }
     }
 
     // Update Particles
@@ -442,8 +561,15 @@ export class Game {
     this.particles = this.particles.filter(p => p.life > 0);
 
     // Update Camera
-    let targetCamX = p.x + p.w/2 - this.camera.w/2;
-    let targetCamY = p.y + p.h/2 - this.camera.h/2 + 50;
+    let lookaheadY = 50;
+    if (this.input.isDown('ArrowDown') || this.input.isDown('KeyS')) {
+      lookaheadY += 200; // Look down
+    } else if (p.vy > 100) {
+      lookaheadY += (p.vy - 100) * 0.3; // Look ahead when falling
+    }
+    
+    let targetCamX = p.x + p.w/2 - this.camera.w/2 + (p.vx * 0.2);
+    let targetCamY = p.y + p.h/2 - this.camera.h/2 + lookaheadY;
     
     // Clamp camera
     const maxCamX = (this.levelData?.width || 0) * TILE_SIZE - this.camera.w;
@@ -472,7 +598,7 @@ export class Game {
   }
 
   private checkCollisions(dx: boolean) {
-    if (!this.levelData) return;
+    if (!this.levelData || !this.levelGrid) return;
     const p = this.player;
     
     const startX = Math.floor(p.x / TILE_SIZE);
@@ -482,9 +608,9 @@ export class Game {
 
     for (let y = startY; y <= endY; y++) {
       for (let x = startX; x <= endX; x++) {
-        if (y < 0 || y >= this.levelData.height || x < 0 || x >= this.levelData.width) continue;
+        if (y < 0 || y >= this.levelGrid.length || x < 0 || x >= this.levelGrid[0].length) continue;
         
-        const row = this.levelData.grid[y];
+        const row = this.levelGrid[y];
         if (!row) continue;
         const tile = row[x];
         
@@ -505,6 +631,7 @@ export class Game {
               if (p.vy > 0) {
                 p.y = tileRect.y - p.h;
                 p.isGrounded = true;
+                p.tricksThisAir.clear();
                 p.canDoubleJump = true;
                 // Landing particles
                 if (p.vy > 400) this.spawnParticles(p.x + p.w/2, p.y + p.h, 5, '#ffffff');
@@ -523,13 +650,27 @@ export class Game {
               p.comboMultiplier = 0;
             }
             this.levelStartScore = this.totalScore;
-            this.setState('WIN', this.currentLevel);
+            if (this.currentLevel !== -1) {
+              this.totalCoins += this.levelCoins;
+              if (this.currentLevel >= this.unlockedLevels) {
+                this.unlockedLevels = this.currentLevel + 1;
+              }
+              this.saveGame();
+            }
+            
+            this.gameStateData = {
+              timeTaken: this.timer.toFixed(2),
+              score: this.totalScore,
+              coinsCollected: this.levelCoins
+            };
+            this.setState('WIN', this.currentLevel, this.gameStateData);
           }
         } else if (tile === 'b') {
           // Bounce pad
           const tileRect = { x: x * TILE_SIZE, y: y * TILE_SIZE + TILE_SIZE / 2, w: TILE_SIZE, h: TILE_SIZE / 2 };
           if (this.isAABB(p, tileRect)) {
             p.vy = this.jumpForce * 1.5;
+            p.isBouncing = true;
             p.isGrounded = false;
             p.canDoubleJump = true;
             this.spawnParticles(p.x + p.w / 2, tileRect.y, 20, '#FF00FF');
@@ -576,6 +717,50 @@ export class Game {
     const cx = Math.floor(this.camera.x);
     const cy = Math.floor(this.camera.y);
 
+    // Parallax Backgrounds
+    ctx.save();
+    
+    // Background glow
+    const grad = ctx.createLinearGradient(0, height, 0, 0);
+    grad.addColorStop(0, '#100520'); // Purpleish dark city bottom
+    grad.addColorStop(1, '#050510'); // Dark blue sky
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, width, height);
+
+    // Far layer (moves 0.1x speed of camera)
+    const px1 = cx * 0.1;
+    ctx.fillStyle = '#0f0a1f';
+    for (let i = -2; i < width / 50 + 2; i++) {
+        let bx = i * 50 - (px1 % 50);
+        let by = height - 100 - Math.abs(Math.sin((i + Math.floor(px1/50)) * 12.5) * 200);
+        ctx.fillRect(bx, by, 51, height - by);
+    }
+    
+    // Mid layer: more detailed buildings
+    const px2 = cx * 0.3;
+    ctx.fillStyle = '#18102a';
+    for (let i = -2; i < width / 80 + 2; i++) {
+        let bID = i + Math.floor(px2/80);
+        let bx = i * 80 - (px2 % 80);
+        let bh = 150 + Math.abs(Math.sin(bID * 43.1) * 300);
+        let by = height - bh;
+        
+        ctx.fillRect(bx, by, 60, bh);
+        
+        // Windows
+        ctx.fillStyle = '#2a1a4a';
+        for (let wy = by + 20; wy < height - 20; wy += 30) {
+            for (let wx = bx + 10; wx < bx + 50; wx += 20) {
+                if (Math.sin(bID + wy + wx) > 0) {
+                    ctx.fillStyle = Math.sin(wx*wy) > 0.8 ? '#00FFFF' : '#2a1a4a'; 
+                    ctx.fillRect(wx, wy, 10, 15);
+                }
+            }
+        }
+        ctx.fillStyle = '#18102a';
+    }
+    ctx.restore();
+
     ctx.translate(-cx, -cy);
 
     // Grid details (optional background style)
@@ -590,8 +775,8 @@ export class Game {
 
     for (let y = startY; y < endY; y++) {
       for (let x = startX; x < endX; x++) {
-        if (y < 0 || y >= this.levelData.height || x < 0 || x >= this.levelData.width) continue;
-        const row = this.levelData.grid[y];
+        if (y < 0 || y >= this.levelGrid.length || x < 0 || x >= this.levelGrid[0].length) continue;
+        const row = this.levelGrid[y];
         if (!row) continue;
         const tile = row[x];
         const tx = x * TILE_SIZE;
@@ -599,19 +784,19 @@ export class Game {
 
         if (tile === '#') {
           // Inner block
-          ctx.fillStyle = '#141414';
+          ctx.fillStyle = '#00FF00'; // Neon accent outer
           ctx.fillRect(tx, ty, TILE_SIZE, TILE_SIZE);
-          
-          // Edges (neon brutalist look)
-          ctx.strokeStyle = '#00FF00'; // Neon accent
-          ctx.lineWidth = 2;
-          ctx.strokeRect(tx, ty, TILE_SIZE, TILE_SIZE);
+          ctx.fillStyle = '#141414'; // Dark inner
+          ctx.fillRect(tx + 2, ty + 2, TILE_SIZE - 4, TILE_SIZE - 4);
         } else if (tile === 'L') {
-          // Goal portal
+          // Glow portal
+          ctx.shadowColor = '#FF00FF';
+          ctx.shadowBlur = 15;
           ctx.fillStyle = '#FF00FF';
           ctx.beginPath();
-          ctx.arc(tx + TILE_SIZE/2, ty + TILE_SIZE/2, TILE_SIZE/3 + Math.sin(Date.now() / 150) * 5, 0, Math.PI*2);
+          ctx.ellipse(tx + TILE_SIZE/2, ty + TILE_SIZE - 20, TILE_SIZE/3, TILE_SIZE/2 + Math.sin(Date.now() / 200) * 5, 0, 0, Math.PI*2);
           ctx.fill();
+          ctx.shadowBlur = 0;
         } else if (['^', 'v', '<', '>'].includes(tile)) {
           ctx.fillStyle = '#FF4444';
           ctx.beginPath();
@@ -642,6 +827,34 @@ export class Game {
       }
     }
 
+    // Draw coins
+    for (const c of this.coinsData) {
+      if (!c.gathered) {
+        ctx.fillStyle = '#FFD700';
+        ctx.beginPath();
+        ctx.arc(c.x, c.y + Math.sin(Date.now()/150)*3, 10, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = '#DAA520';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        ctx.fillStyle = '#FFF8DC';
+        ctx.beginPath();
+        ctx.arc(c.x - 3, c.y - 3 + Math.sin(Date.now()/150)*3, 3, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    // Draw enemies
+    for (const e of this.enemiesData) {
+      if (!e.dead) {
+        ctx.fillStyle = '#ff0000';
+        ctx.fillRect(e.x, e.y, e.w, e.h);
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(e.x + (e.dir === 1 ? 16 : 4), e.y + 4, 4, 4); // eye
+      }
+    }
+
     // Draw particles
     for (const p of this.particles) {
       ctx.fillStyle = p.color;
@@ -662,106 +875,100 @@ export class Game {
       ctx.globalAlpha = 1.0;
     }
 
+    // Draw Tutorials
+    if (this.levelData.tutorials) {
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 20px monospace';
+        for (const tut of this.levelData.tutorials) {
+            const tx = tut.x * TILE_SIZE;
+            const ty = tut.y * TILE_SIZE;
+            ctx.fillStyle = '#000';
+            ctx.fillText(tut.text, tx + 2, ty + 2);
+            ctx.fillStyle = '#00FFFF';
+            ctx.fillText(tut.text, tx, ty);
+        }
+    }
+
     // Draw player
     if (!this.player.dead) {
       const px = this.player.x;
       const py = this.player.y;
       
-      const anim = this.animations[this.player.animState];
-      if (anim && anim.image) {
-        ctx.save();
-        // The player sprite is 32x32, hitbox is 24x24
-        // So we need to draw it slightly offset (-4, -8) to fit
-        const drawX = px + this.player.w/2;
-        const drawY = py + this.player.h - 16;
-        
-        ctx.translate(drawX, drawY);
-        // Flip horizontally if facing left
-        if (this.player.facing === -1) {
-          ctx.scale(-1, 1);
-        }
-
-        // Add squeeze/squash based on velocity
-        let squeezeX = 1;
-        let squeezeY = 1;
-        if (!this.player.isGrounded && !this.player.wallTouch && !this.player.isDashing) {
-          squeezeY = 1 + Math.min(Math.abs(this.player.vy) / 1500, 0.4);
-          squeezeX = 1 - Math.min(Math.abs(this.player.vy) / 1500, 0.4);
-        } else if (this.player.isDashing) {
-          squeezeX = 1.4;
-          squeezeY = 0.6;
-        } else if (this.player.wallTouch) {
-          squeezeY = 1.2;
-          squeezeX = 0.8;
-        }
-        ctx.scale(squeezeX, squeezeY);
-
-        ctx.drawImage(
-          anim.image,
-          this.player.animFrame * 32, 0, 32, 32,
-          -16, -16, 32, 32
-        );
-        ctx.restore();
-      } else {
-        // Fallback procedural
-        // Shadow/Trail if dashing
-        if (this.player.isDashing) {
-          ctx.fillStyle = 'rgba(0, 255, 255, 0.5)';
-          ctx.fillRect(px - this.player.vx * 0.05, py, this.player.w, this.player.h);
-        }
-        
-        ctx.fillStyle = '#00FFFF'; // Player cyan
-        let squeezeX = 1;
-        let squeezeY = 1;
-
-        if (!this.player.isGrounded && !this.player.wallTouch && !this.player.isDashing) {
-          squeezeY = 1 + Math.min(Math.abs(this.player.vy) / 1500, 0.4);
-          squeezeX = 1 - Math.min(Math.abs(this.player.vy) / 1500, 0.4);
-        } else if (this.player.isDashing) {
-          squeezeX = 1.4;
-          squeezeY = 0.6;
-        } else if (this.player.wallTouch) {
-          squeezeY = 1.2;
-          squeezeX = 0.8;
-        }
-
-        const drawW = this.player.w * squeezeX;
-        const drawH = this.player.h * squeezeY;
-        const drawX = px + (this.player.w - drawW)/2;
-        const drawY = py + (this.player.h - drawH);
-
-        ctx.fillRect(drawX, drawY, drawW, drawH);
-
-        // Eye
-        ctx.fillStyle = '#000';
-        const eyeOffset = this.player.facing === 1 ? 4 : -10;
-        ctx.fillRect(drawX + drawW/2 + eyeOffset, drawY + 4, 6, 6);
+      // Shadow/Trail if dashing
+      if (this.player.isDashing || this.player.comboMultiplier > 2) {
+        ctx.fillStyle = this.aesthetics.trailColor;
+        ctx.fillRect(px - this.player.vx * 0.05, py, this.player.w, this.player.h);
       }
+      
+      ctx.fillStyle = this.aesthetics.playerColor; // Custom player color
+      // Stretch depending on velocity
+      let squeezeX = 1;
+      let squeezeY = 1;
+
+      if (!this.player.isGrounded && !this.player.wallTouch && !this.player.isDashing) {
+        squeezeY = 1 + Math.min(Math.abs(this.player.vy) / 1500, 0.4);
+        squeezeX = 1 - Math.min(Math.abs(this.player.vy) / 1500, 0.4);
+      } else if (this.player.isDashing) {
+        squeezeX = 1.4;
+        squeezeY = 0.6;
+      } else if (this.player.wallTouch) {
+        squeezeY = 1.2;
+        squeezeX = 0.8;
+      }
+
+      const drawW = this.player.w * squeezeX;
+      const drawH = this.player.h * squeezeY;
+      const drawX = px + (this.player.w - drawW)/2;
+      const drawY = py + (this.player.h - drawH);
+
+      ctx.fillRect(drawX, drawY, drawW, drawH);
+
+      // Eye
+      ctx.fillStyle = '#000';
+      const eyeOffset = this.player.facing === 1 ? 4 : -10;
+      ctx.fillRect(drawX + drawW/2 + eyeOffset, drawY + 4, 6, 6);
     }
 
     ctx.restore(); // Pop camera
 
     // HUD
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 24px Anton, sans-serif';
+    ctx.font = 'bold 20px Anton, sans-serif';
     ctx.textAlign = 'right';
     let displayScore = this.totalScore;
     if (this.player.comboMultiplier > 0) displayScore += this.player.comboScore * this.player.comboMultiplier;
-    ctx.fillText(`SCORE: ${displayScore}`, width - 20, 40);
+    
+    ctx.fillText(`SCORE: ${displayScore}`, width - 20, 30);
+    ctx.font = 'bold 16px Anton, sans-serif';
+    ctx.fillStyle = '#FFD700';
+    ctx.fillText(`COINS: ${this.levelCoins} / ${this.totalCoins}`, width - 20, 50);
+    ctx.fillStyle = '#A8A8A8';
+    ctx.fillText(`TIME: ${this.timer.toFixed(1)}s`, width - 20, 70);
 
+    // Stamina Bar
+    const stamW = Math.min(200, width - 40);
+    const stamH = 8;
+    const stamX = width / 2 - stamW / 2;
+    const stamY = height - 20;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(stamX, stamY, stamW, stamH);
+    ctx.fillStyle = this.player.stamina > 30 ? '#00FF00' : '#FF0000';
+    ctx.fillRect(stamX, stamY, stamW * (this.player.stamina / 100), stamH);
+
+    ctx.textAlign = 'center';
     if (this.player.comboMultiplier > 0) {
       ctx.fillStyle = '#FF00FF';
-      ctx.font = 'bold 36px Anton, sans-serif';
-      ctx.fillText(`x${this.player.comboMultiplier} COMBO`, width - 20, 80);
+      ctx.font = 'bold 24px Anton, sans-serif';
+      ctx.fillText(`x${this.player.comboMultiplier} COMBO`, width / 2, stamY - 30);
       
       // Combo bar
-      const barW = 150;
-      const barH = 8;
+      const barW = Math.min(150, width - 40);
+      const barH = 6;
       const fill = Math.max(0, this.player.comboTimer / 2.0);
       ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
-      ctx.fillRect(width - 20 - barW, 95, barW, barH);
+      ctx.fillRect((width - barW) / 2, stamY - 20, barW, barH);
       ctx.fillStyle = `hsl(${fill * 120}, 100%, 50%)`;
-      ctx.fillRect(width - 20 - barW, 95, barW * fill, barH);
+      ctx.fillRect((width - barW) / 2, stamY - 20, barW * fill, barH);
     }
   }
 }

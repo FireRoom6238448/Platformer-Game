@@ -1,0 +1,21 @@
+{
+  "name": "Neon Dash",
+  "short_name": "Neon Dash",
+  "start_url": "/",
+  "display": "fullscreen",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "https://api.iconify.design/mdi:controller-classic.svg?color=%2310b981",
+      "sizes": "192x192",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "https://api.iconify.design/mdi:controller-classic.svg?color=%2310b981",
+      "sizes": "512x512",
+      "type": "image/svg+xml"
+    }
+  ]
+}

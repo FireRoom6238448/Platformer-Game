@@ -10,6 +10,10 @@ export class InputManager {
     window.addEventListener('keyup', (e) => {
       this.keys[e.code] = false;
     });
+    window.addEventListener('blur', () => {
+      this.keys = {};
+      this.justPressed = {};
+    });
   }
 
   update() {
@@ -20,9 +24,13 @@ export class InputManager {
       } else {
         this.justPressed[key] = false;
       }
+      this.previousKeys[key] = this.keys[key];
     }
-    // Update previous keys
-    this.previousKeys = { ...this.keys };
+    for (const key in this.previousKeys) {
+      if (!this.keys[key]) {
+        this.previousKeys[key] = false;
+      }
+    }
   }
 
   isDown(code: string) {
